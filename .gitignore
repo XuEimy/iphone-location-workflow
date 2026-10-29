@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+*.log
+*.pem
+*.key
+*.p12
+*.mobileprovision
+status.json
+location-state.json
+stop-location
