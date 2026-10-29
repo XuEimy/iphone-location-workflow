@@ -126,8 +126,8 @@ def run_device(args, root):
             report(root, "error", message="Session failed. Run clear and verify the real position in Maps.")
             raise
         else:
-            report(root, "cleared")
-            print("Clear command sent. Reopen Maps and verify your real position.", flush=True)
+            report(root, "clearing")
+            print("Updates stopped; initial clear sent. Reconnecting for final clear.", flush=True)
         finally:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.remove_signal_handler(sig)
@@ -155,7 +155,32 @@ def run_device(args, root):
         sys.argv = original_argv
 
 
-def stop_session(root, timeout=30):
+def run_start_and_restore(args, root):
+    """Clear again on a fresh connection AFTER the holding connection closes.
+
+    The caller keeps the session lock throughout both calls. Even a successful
+    first clear needs the independent pass observed to work on the test device.
+    run_device restores its adapter and exits the upstream connection contexts
+    before returning, so this invocation creates a new connection to the SAME
+    explicitly selected device. No second simulation command is issued.
+    """
+    try:
+        result = run_device(args, root)
+    finally:
+        report(root, "clearing")
+        clear_args = argparse.Namespace(command="clear", udid=args.udid, transport=args.transport)
+        try:
+            clear_result = run_device(clear_args, root)
+        except BaseException:
+            report(root, "error", message="Final clear failed. Reconnect the phone and run clear explicitly.")
+            raise
+        if clear_result:
+            report(root, "error", message="Final clear failed. Reconnect the phone and run clear explicitly.")
+            raise RuntimeError("Final clear failed. Keep the phone connected and run clear --udid DEVICE_UDID.")
+    return result
+
+
+def stop_session(root, timeout=120):
     if not is_running(root):
         print("No workflow session is running. If Maps is still simulated, use clear --udid DEVICE_UDID.")
         return 1
@@ -167,8 +192,8 @@ def stop_session(root, timeout=30):
         raise RuntimeError("Stop timed out. Keep the phone connected; check the active terminal before retrying.")
     status = json.loads((root / "status.json").read_text())
     if status.get("phase") != "cleared":
-        raise RuntimeError("The session exited without confirmed command delivery. Run clear --udid DEVICE_UDID.")
-    print("Simulation stopped; clear command sent. Verify the real position in Maps.")
+        raise RuntimeError("The session exited without completing final clear. Run clear --udid DEVICE_UDID.")
+    print("Simulation stopped; final clear sent on a new connection. Verify the real position in Maps.")
     return 0
 
 
@@ -209,7 +234,7 @@ def main(argv=None):
         (root / "stop").unlink(missing_ok=True)
         report(root, "connecting")
         try:
-            result = run_device(args, root)
+            result = run_start_and_restore(args, root) if args.command == "start" else run_device(args, root)
         except BaseException:
             report(root, "error", message="Check connection, then run clear if needed.")
             raise

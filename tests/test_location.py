@@ -1,4 +1,6 @@
 import asyncio
+import argparse
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +81,81 @@ class SessionTests(unittest.TestCase):
     def test_inactive_stop_does_not_claim_restoration(self):
         with tempfile.TemporaryDirectory() as folder:
             self.assertEqual(location.stop_session(Path(folder)), 1)
+
+
+class RestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.args = argparse.Namespace(command="start", udid="TEST-DEVICE", transport="userspace")
+
+    def test_successful_first_clear_still_gets_independent_clear_under_lock(self):
+        calls = []
+
+        def device(args, root):
+            self.assertTrue(location.is_running(root))
+            calls.append(args.command)
+            self.assertEqual(args.udid, "TEST-DEVICE")
+            self.assertEqual(args.transport, "userspace")
+            if args.command == "clear":
+                # The hold invocation has returned before the next one begins.
+                self.assertEqual(calls, ["start", "clear"])
+                self.assertEqual(json.loads((root / "status.json").read_text())["phase"], "clearing")
+                location.report(root, "cleared")
+            return 0
+
+        with location.exclusive(self.root), patch("location.run_device", side_effect=device):
+            self.assertEqual(location.run_start_and_restore(self.args, self.root), 0)
+        self.assertEqual(calls, ["start", "clear"])
+
+    def test_failed_hold_still_attempts_final_clear_and_preserves_failure(self):
+        with patch("location.run_device", side_effect=[1, 0]) as device:
+            self.assertEqual(location.run_start_and_restore(self.args, self.root), 1)
+        self.assertEqual([call.args[0].command for call in device.call_args_list], ["start", "clear"])
+
+    def test_hold_exception_still_attempts_final_clear(self):
+        with patch("location.run_device", side_effect=[OSError("lost transport"), 0]) as device:
+            with self.assertRaisesRegex(OSError, "lost transport"):
+                location.run_start_and_restore(self.args, self.root)
+        self.assertEqual(device.call_args_list[1].args[0].command, "clear")
+
+    def test_final_clear_failure_cannot_report_success(self):
+        with patch("location.run_device", side_effect=[0, 1]):
+            with self.assertRaisesRegex(RuntimeError, "Final clear failed"):
+                location.run_start_and_restore(self.args, self.root)
+        self.assertEqual(json.loads((self.root / "status.json").read_text())["phase"], "error")
+
+    def test_final_clear_exception_cannot_report_success(self):
+        with patch("location.run_device", side_effect=[0, OSError("phone absent")]):
+            with self.assertRaises(OSError):
+                location.run_start_and_restore(self.args, self.root)
+        self.assertEqual(json.loads((self.root / "status.json").read_text())["phase"], "error")
+
+    def test_main_routes_start_through_final_clear(self):
+        with patch("location.state_dir", return_value=self.root), patch("location.run_device", return_value=0) as device:
+            self.assertEqual(location.main(["start", "--udid", "TEST-DEVICE", "--latitude", "1", "--longitude", "2"]), 0)
+        self.assertEqual([call.args[0].command for call in device.call_args_list], ["start", "clear"])
+
+    def test_standalone_clear_does_not_start_simulation_or_recurse(self):
+        with patch("location.state_dir", return_value=self.root), patch("location.run_device", return_value=0) as device:
+            self.assertEqual(location.main(["clear", "--udid", "TEST-DEVICE"]), 0)
+        self.assertEqual([call.args[0].command for call in device.call_args_list], ["clear"])
+
+    def test_stop_waits_through_final_clear_before_returning(self):
+        location.report(self.root, "cleared")
+        # Session lock remains held during both cleanup stages.
+        with patch("location.is_running", side_effect=[True, True, True, False, False]) as running, patch("location.time.sleep") as sleep:
+            self.assertEqual(location.stop_session(self.root), 0)
+        self.assertEqual(running.call_count, 5)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue((self.root / "stop").exists())
+
+    def test_stop_rejects_incomplete_final_clear(self):
+        location.report(self.root, "error")
+        with patch("location.is_running", side_effect=[True, False, False]):
+            with self.assertRaisesRegex(RuntimeError, "without completing final clear"):
+                location.stop_session(self.root)
 
 
 if __name__ == "__main__":
